@@ -1,0 +1,546 @@
+diff --git a/drivers/net/can/c_can/c_can.c b/drivers/net/can/c_can/c_can.c
+index 055457619c1e..4205d92bd805 100644
+--- a/drivers/net/can/c_can/c_can.c
++++ b/drivers/net/can/c_can/c_can.c
+@@ -43,6 +43,11 @@
+ 
+ #include "c_can.h"
+ 
++/* Identification of Tritium modifications */
++#define TRITIUM_MOD_NAME     "Resilient Tx/Rx buffer handling"
++#define TRITIUM_MOD_VERSION  "v4.3.2"
++
++
+ /* Number of interface registers */
+ #define IF_ENUM_REG_LEN		11
+ #define C_CAN_IFACE(reg, iface)	(C_CAN_IF1_##reg + (iface) * IF_ENUM_REG_LEN)
+@@ -151,17 +156,30 @@
+ #define IF_MCONT_EOB		BIT(7)
+ #define IF_MCONT_DLC_MASK	0xf
+ 
+-#define IF_MCONT_RCV		(IF_MCONT_RXIE | IF_MCONT_UMASK)
++/* Tritium modification: don't set RXIE in Rx buffers
++ *
++ * The status interrupt for RXOK triggers a full Rx buffer poll,
++ * so skipping RXIE shouldn't harm receive latency at all.
++ */
++
++#define IF_MCONT_RCV		(IF_MCONT_UMASK)
+ #define IF_MCONT_RCV_EOB	(IF_MCONT_RCV | IF_MCONT_EOB)
+ 
+-#define IF_MCONT_TX		(IF_MCONT_TXIE | IF_MCONT_EOB)
++/* Tritium modification: don't set TXIE in Rx buffers
++ *
++ * Instead we rely on MSGVAL2 and TXRQST2 to track the Tx buffer state.
++ */
++#define IF_MCONT_TX		(IF_MCONT_EOB)
+ 
+ /*
+- * Use IF1 for RX and IF2 for TX
++ * Use IF1 for ISR status polling and IF2 for on-demand TX
+  */
+-#define IF_RX			0
++#define IF_POLL			0
+ #define IF_TX			1
+ 
++/* Final Tx bit in MSGVAL2, TXRQST2 */
++#define FINAL_TX_BIT (1 << (C_CAN_MSG_OBJ_TX_NUM -1))
++
+ /* minimum timeout for checking BUSY status */
+ #define MIN_TIMEOUT_VALUE	6
+ 
+@@ -239,10 +257,14 @@ static inline void c_can_reset_ram(const struct c_can_priv *priv, bool enable)
+ 
+ static void c_can_irq_control(struct c_can_priv *priv, bool enable)
+ {
+-	u32 ctrl = priv->read_reg(priv,	C_CAN_CTRL_REG) & ~CONTROL_IRQMSK;
++	u32 ctrl = priv->read_reg(priv,	C_CAN_CTRL_REG) | CONTROL_IRQMSK;
+ 
+-	if (enable)
+-		ctrl |= CONTROL_IRQMSK;
++	/* EIE and SIE are always set, so the interrupt pending register
++	 * always gets updated. Only IE gets toggled off to prevent the
++	 * generation of a CPU interrupt.
++	 */
++	if (!enable)
++		ctrl &= ~CONTROL_IE;
+ 
+ 	priv->write_reg(priv, C_CAN_CTRL_REG, ctrl);
+ }
+@@ -276,14 +298,16 @@ static inline void c_can_object_put(struct net_device *dev, int iface,
+ }
+ 
+ /*
+- * Note: According to documentation clearing TXIE while MSGVAL is set
+- * is not allowed, but works nicely on C/DCAN. And that lowers the I/O
+- * load significantly.
++ * Note: We don't clear the full message ID from Tx buffers.
++ *
++ *       Instead, we just ensure MSGVAL and TXIE are cleared, since
++ *       start_xmit will reconfigure everything when it uses the buffer.
+  */
+ static void c_can_inval_tx_object(struct net_device *dev, int iface, int obj)
+ {
+ 	struct c_can_priv *priv = netdev_priv(dev);
+ 
++	priv->write_reg(priv, C_CAN_IFACE(ARB2_REG, iface), 0);
+ 	priv->write_reg(priv, C_CAN_IFACE(MSGCTRL_REG, iface), 0);
+ 	c_can_object_put(dev, iface, obj, IF_COMM_INVAL);
+ }
+@@ -293,12 +317,11 @@ static void c_can_inval_msg_object(struct net_device *dev, int iface, int obj)
+ 	struct c_can_priv *priv = netdev_priv(dev);
+ 
+ 	priv->write_reg(priv, C_CAN_IFACE(ARB1_REG, iface), 0);
+-	priv->write_reg(priv, C_CAN_IFACE(ARB2_REG, iface), 0);
+ 	c_can_inval_tx_object(dev, iface, obj);
+ }
+ 
+ static void c_can_setup_tx_object(struct net_device *dev, int iface,
+-				  struct can_frame *frame, int idx)
++				  struct can_frame *frame, u32 idx)
+ {
+ 	struct c_can_priv *priv = netdev_priv(dev);
+ 	u16 ctrl = IF_MCONT_TX | frame->can_dlc;
+@@ -316,10 +339,7 @@ static void c_can_setup_tx_object(struct net_device *dev, int iface,
+ 	if (!rtr)
+ 		arb |= IF_ARB_TRANSMIT;
+ 
+-	/*
+-	 * If we change the DIR bit, we need to invalidate the buffer
+-	 * first, i.e. clear the MSGVAL flag in the arbiter.
+-	 */
++	/* Fully reset the buffer if DIR changes */
+ 	if (rtr != (bool)test_bit(idx, &priv->tx_dir)) {
+ 		u32 obj = idx + C_CAN_MSG_OBJ_TX_FIRST;
+ 
+@@ -351,15 +371,6 @@ static void c_can_setup_tx_object(struct net_device *dev, int iface,
+ 	}
+ }
+ 
+-static inline void c_can_activate_all_lower_rx_msg_obj(struct net_device *dev,
+-						       int iface)
+-{
+-	int i;
+-
+-	for (i = C_CAN_MSG_OBJ_RX_FIRST; i <= C_CAN_MSG_RX_LOW_LAST; i++)
+-		c_can_object_get(dev, iface, i, IF_COMM_CLR_NEWDAT);
+-}
+-
+ static int c_can_handle_lost_msg_obj(struct net_device *dev,
+ 				     int iface, int objno, u32 ctrl)
+ {
+@@ -459,7 +470,8 @@ static netdev_tx_t c_can_start_xmit(struct sk_buff *skb,
+ {
+ 	struct can_frame *frame = (struct can_frame *)skb->data;
+ 	struct c_can_priv *priv = netdev_priv(dev);
+-	u32 idx, obj;
++	u32 idx, last_active_offset, next_free_obj, expected_tx_bit;
++	int tx_bit_checks_remaining;
+ 
+ 	if (can_dropped_invalid_skb(dev, skb))
+ 		return NETDEV_TX_OK;
+@@ -467,12 +479,21 @@ static netdev_tx_t c_can_start_xmit(struct sk_buff *skb,
+ 	 * This is not a FIFO. C/D_CAN sends out the buffers
+ 	 * prioritized. The lowest buffer number wins.
+ 	 */
+-	idx = fls(atomic_read(&priv->tx_active));
+-	obj = idx + C_CAN_MSG_OBJ_TX_FIRST;
++	idx = last_active_offset = fls(atomic_read(&priv->tx_active));
++	next_free_obj = last_active_offset + C_CAN_MSG_OBJ_TX_FIRST;
++
++	if (next_free_obj > C_CAN_MSG_OBJ_TX_LAST) {
++		netdev_err(dev, "Tx request received with last Tx buffer in use");
++		return NETDEV_TX_BUSY;
++	}
+ 
+-	/* If this is the last buffer, stop the xmit queue */
+-	if (idx == C_CAN_MSG_OBJ_TX_NUM - 1)
++	/* If this is the last buffer, stop the xmit queue. We must do this
++	 * before we enable transmit, as we might race against do_tx().
++	 */
++	if (next_free_obj == C_CAN_MSG_OBJ_TX_LAST) {
+ 		netif_stop_queue(dev);
++	}
++
+ 	/*
+ 	 * Store the message in the interface so we can call
+ 	 * can_put_echo_skb(). We must do this before we enable
+@@ -482,10 +503,34 @@ static netdev_tx_t c_can_start_xmit(struct sk_buff *skb,
+ 	priv->dlc[idx] = frame->can_dlc;
+ 	can_put_echo_skb(skb, dev, idx);
+ 
+-	/* Update the active bits */
+-	atomic_add((1 << idx), &priv->tx_active);
+ 	/* Start transmission */
+-	c_can_object_put(dev, IF_TX, obj, IF_COMM_TX);
++	c_can_object_put(dev, IF_TX, next_free_obj, IF_COMM_TX);
++
++	/* Ensure relevant bit in MSGVAL2 is set before setting tx_active
++	 * 
++	 * This ensures do_tx won't touch the buffer until both echo_skb and
++	 * the CAN device are set up properly.
++	 *
++	 * We allow the transmit queue to stall for up to 128 microseconds
++	 * plus scheduling latency while looking for the expected flag status.
++	 */
++	tx_bit_checks_remaining = 128;
++	expected_tx_bit = 1 << idx;
++	while (!(expected_tx_bit & priv->read_reg(priv, C_CAN_MSGVAL2_REG))) {
++		udelay(1);
++		tx_bit_checks_remaining--;
++		if (!tx_bit_checks_remaining) {
++			break;
++		}
++	}
++
++	/* Emit a warning if we didn't see MSGVAL2 get set as expected */
++	if (!tx_bit_checks_remaining) {
++		netdev_warn(dev, "Failed to see MSGVAL2 bit set for Tx buffer %u", idx+1);
++	}
++
++	/* Tell do_tx to process this transmit buffer */
++	atomic_add_return(expected_tx_bit, &priv->tx_active);
+ 
+ 	return NETDEV_TX_OK;
+ }
+@@ -558,13 +603,13 @@ static void c_can_configure_msg_objects(struct net_device *dev)
+ 
+ 	/* first invalidate all message objects */
+ 	for (i = C_CAN_MSG_OBJ_RX_FIRST; i <= C_CAN_NO_OF_OBJECTS; i++)
+-		c_can_inval_msg_object(dev, IF_RX, i);
++		c_can_inval_msg_object(dev, IF_TX, i);
+ 
+ 	/* setup receive message objects */
+ 	for (i = C_CAN_MSG_OBJ_RX_FIRST; i < C_CAN_MSG_OBJ_RX_LAST; i++)
+-		c_can_setup_receive_object(dev, IF_RX, i, 0, 0, IF_MCONT_RCV);
++		c_can_setup_receive_object(dev, IF_TX, i, 0, 0, IF_MCONT_RCV);
+ 
+-	c_can_setup_receive_object(dev, IF_RX, C_CAN_MSG_OBJ_RX_LAST, 0, 0,
++	c_can_setup_receive_object(dev, IF_TX, C_CAN_MSG_OBJ_RX_LAST, 0, 0,
+ 				   IF_MCONT_RCV_EOB);
+ }
+ 
+@@ -627,6 +672,11 @@ static int c_can_start(struct net_device *dev)
+ 
+ 	priv->can.state = CAN_STATE_ERROR_ACTIVE;
+ 
++	netdev_info(dev,
++                    "Tritium: "
++                    TRITIUM_MOD_NAME " "
++                    TRITIUM_MOD_VERSION " driver started\n"
++        );
+ 	return 0;
+ }
+ 
+@@ -689,37 +739,88 @@ static int c_can_get_berr_counter(const struct net_device *dev,
+ 	return err;
+ }
+ 
+-static void c_can_do_tx(struct net_device *dev)
++static void c_can_flush_tx_objects(struct net_device *dev, u32 pend)
+ {
+ 	struct c_can_priv *priv = netdev_priv(dev);
+-	struct net_device_stats *stats = &dev->stats;
+-	u32 idx, obj, pkts = 0, bytes = 0, pend, clr;
+-
+-	clr = pend = priv->read_reg(priv, C_CAN_INTPND2_REG);
++	u32 idx, obj, clr, pkts = 0, bytes = 0;
+ 
++	clr = pend;
+ 	while ((idx = ffs(pend))) {
+ 		idx--;
+ 		pend &= ~(1 << idx);
+ 		obj = idx + C_CAN_MSG_OBJ_TX_FIRST;
+-		c_can_inval_tx_object(dev, IF_RX, obj);
++		mb(); /* Ensure we see any updates from start_xmit */
+ 		can_get_echo_skb(dev, idx);
++		mb(); /* Force start_xmit to see this, even on another CPU */
++		c_can_inval_tx_object(dev, IF_POLL, obj);
+ 		bytes += priv->dlc[idx];
+ 		pkts++;
+ 	}
+ 
+-	/* Clear the bits in the tx_active mask */
+-	atomic_sub(clr, &priv->tx_active);
+-
+-	if (clr & (1 << (C_CAN_MSG_OBJ_TX_NUM - 1)))
+-		netif_wake_queue(dev);
+-
+ 	if (pkts) {
++		struct net_device_stats *stats = &dev->stats;
+ 		stats->tx_bytes += bytes;
+ 		stats->tx_packets += pkts;
+ 		can_led_event(dev, CAN_LED_EVENT_TX);
+ 	}
+ }
+ 
++
++static void c_can_do_tx(struct net_device *dev)
++{
++	struct c_can_priv *priv = netdev_priv(dev);
++	u32 tx_requested, tx_valid, tx_pending, tx_complete;
++
++	tx_requested = atomic_read(&priv->tx_active);
++	tx_valid = priv->read_reg(priv, C_CAN_MSGVAL2_REG);
++	tx_pending = priv->read_reg(priv, C_CAN_TXRQST2_REG);
++
++	/* Top 16 bits should always be clear */
++	if (tx_valid > 0xFFFF) {
++		netdev_warn(dev, "Ignoring unexpectedly set high order bits in MSGVAL2: 0x%x", tx_valid);
++		tx_valid &= 0xFFFF;
++	}
++
++	if (tx_pending > 0xFFFF) {
++		netdev_warn(dev, "Ignoring unexpectedly set high order bits in TXRQST2: 0x%x", tx_pending);
++		tx_pending &= 0xFFFF;
++	}
++
++	tx_complete = tx_requested & tx_valid & ~tx_pending;
++	rmb(); /* Force a memory barrier to sync the echo_skb state */
++	c_can_flush_tx_objects(dev, tx_complete);
++	atomic_sub_return(tx_complete, &priv->tx_active);
++
++	if (tx_complete & FINAL_TX_BIT) {
++		/* All hardware Tx buffers should be drained at this point
++		 * and the network queue should be stopped.
++		 */
++		tx_valid = priv->read_reg(priv, C_CAN_MSGVAL2_REG);
++		if (tx_valid) {
++			netdev_warn(dev, "Tx buffers unexpectedly marked as valid: 0x%x", tx_valid);
++			netdev_info(dev, "  Flushing all unexpectedly valid Tx buffers");
++			c_can_flush_tx_objects(dev, tx_valid);
++		}
++		atomic_set(&priv->tx_active, 0);
++		netif_wake_queue(dev);
++	} else if ((tx_requested & tx_valid) != tx_requested) {
++		u32 tx_missing = tx_requested & ~tx_valid;
++		netdev_warn(dev, "Tx buffers unexpectedly marked as invalid: 0x%x", tx_missing);
++		netdev_info(dev, "  Updating driver state to match device state");
++		c_can_flush_tx_objects(dev, tx_missing);
++		atomic_sub_return(tx_missing, &priv->tx_active);
++		if (tx_missing & FINAL_TX_BIT) {
++			netif_wake_queue(dev);
++		}
++	}
++	/* NOTE: When (tx_requested & tx_valid) != tx_valid, we'd ideally start a timer to periodically
++	 * check the transmit queue state, otherwise things may get stuck if we get the status interrupt
++	 * for the final Tx buffer before the flag gets set in tx_active. For the Tritium use case though,
++	 * we're always receiving heartbeat messages on the CAN bus, so those act as our periodic timer.
++	 * (The transmit queue state is checked every time we receive an interrupt for any reason)
++	 */
++}
++
+ /*
+  * If we have a gap in the pending bits, that means we either
+  * raced with the hardware or failed to readout all upper
+@@ -752,17 +853,21 @@ static u32 c_can_adjust_pending(u32 pend)
+ 	return pend & ~((1 << lasts) - 1);
+ }
+ 
+-static inline void c_can_rx_object_get(struct net_device *dev,
+-				       struct c_can_priv *priv, u32 obj)
++static inline int c_can_rx_object_get(struct net_device *dev,
++				      struct c_can_priv *priv, u32 obj)
+ {
+-		c_can_object_get(dev, IF_RX, obj, priv->comm_rcv_high);
++	if (obj < C_CAN_MSG_OBJ_RX_FIRST || obj > C_CAN_MSG_OBJ_RX_LAST) {
++		return -1;
++	}
++	c_can_object_get(dev, IF_POLL, obj, priv->comm_rcv_high);
++	return 0;
+ }
+ 
+ static inline void c_can_rx_finalize(struct net_device *dev,
+ 				     struct c_can_priv *priv, u32 obj)
+ {
+ 	if (priv->type != BOSCH_D_CAN)
+-		c_can_object_get(dev, IF_RX, obj, IF_COMM_CLR_NEWDAT);
++		c_can_object_get(dev, IF_POLL, obj, IF_COMM_CLR_NEWDAT);
+ }
+ 
+ static int c_can_read_objects(struct net_device *dev, struct c_can_priv *priv,
+@@ -773,15 +878,24 @@ static int c_can_read_objects(struct net_device *dev, struct c_can_priv *priv,
+ 	while ((obj = ffs(pend)) && quota > 0) {
+ 		pend &= ~BIT(obj - 1);
+ 
+-		c_can_rx_object_get(dev, priv, obj);
+-		ctrl = priv->read_reg(priv, C_CAN_IFACE(MSGCTRL_REG, IF_RX));
++		if (c_can_rx_object_get(dev, priv, obj) < 0) {
++			netdev_warn(dev, "Ignoring attempt to read invalid Rx buffer ID %u", obj);
++			continue;
++		}
++		ctrl = priv->read_reg(priv, C_CAN_IFACE(MSGCTRL_REG, IF_POLL));
+ 
+ 		if (ctrl & IF_MCONT_MSGLST) {
+-			int n = c_can_handle_lost_msg_obj(dev, IF_RX, obj, ctrl);
++			int n = c_can_handle_lost_msg_obj(dev, IF_POLL, obj, ctrl);
+ 
++			netdev_warn(dev, "Receive overrun detected for: %x", obj);
+ 			pkts += n;
+ 			quota -= n;
+ 			continue;
++			/* ncoghlan: This handling doesn't seem right, as the message
++			 * *in* the buffer is still valid, but we're throwing it away.
++			 * MSGLST only indicates that there was an even *earlier* message
++			 * that we never read.
++			 */
+ 		}
+ 
+ 		/*
+@@ -789,16 +903,19 @@ static int c_can_read_objects(struct net_device *dev, struct c_can_priv *priv,
+ 		 * odd HW behaviour. Do not remove that unless you
+ 		 * want to brick your machine.
+ 		 */
+-		if (!(ctrl & IF_MCONT_NEWDAT))
++		if (!(ctrl & IF_MCONT_NEWDAT)) {
++			netdev_warn(dev, "Rx buffer pending flag without NEWDAT: %u", obj);
+ 			continue;
++		}
+ 
+ 		/* read the data from the message object */
+-		c_can_read_msg_object(dev, IF_RX, ctrl);
++		c_can_read_msg_object(dev, IF_POLL, ctrl);
+ 
+ 		c_can_rx_finalize(dev, priv, obj);
+ 
+ 		pkts++;
+ 		quota--;
++
+ 	}
+ 
+ 	return pkts;
+@@ -815,14 +932,20 @@ static inline u32 c_can_get_pending(struct c_can_priv *priv)
+  * theory of operation:
+  *
+  * c_can core saves a received CAN message into the first free message
+- * object it finds free (starting with the lowest). Bits NEWDAT and
+- * INTPND are set for this message object indicating that a new message
+- * has arrived. To work-around this issue, we keep two groups of message
+- * objects whose partitioning is defined by C_CAN_MSG_OBJ_RX_SPLIT.
++ * object it finds free (starting with the lowest). NEWDAT is
++ * set for this message object indicating that a new message
++ * has arrived. This would be fine if we always read every message
++ * before returning, but NAPI quota management means we may sometimes
++ * return early with some messages unread.
+  *
+- * We clear the newdat bit right away.
++ * To try to minimise message reordering, we check for a gap in the
++ * NEWDAT bits, and if we find one, we prioritise the messages after
++ * the gap by temporarily ignoring the messages before the gap.
+  *
+- * This can result in packet reordering when the readout is slow.
++ * This approach can still result in packet reordering when the
++ * readout is slow enough and the level of CAN bus traffic is high
++ * enough to refill all the previously read buffers (eliminating the
++ * NEWDAT gap entirely) before we start reading again.
+  */
+ static int c_can_do_rx_poll(struct net_device *dev, int quota)
+ {
+@@ -839,8 +962,24 @@ static int c_can_do_rx_poll(struct net_device *dev, int quota)
+ 	while (quota > 0) {
+ 		if (!pend) {
+ 			pend = c_can_get_pending(priv);
+-			if (!pend)
+-				break;
++			if (!pend) {
++				/* Check for and report mismatches beween NEWDAT1 & INTPND1
++				 *
++				 * Even with RXIE disabled, we sometimes still see interrupts
++				 * getting stuck on for Rx buffers, this makes sure we still
++				 * process those buffers appropriately.
++				 */
++				pend = priv->read_reg(priv, C_CAN_INTPND1_REG);
++				if (!pend) {
++					break;
++				}
++				netdev_warn(dev, "Rx interrupt flags unexpectedly set: 0x%x", pend);
++			}
++			/* Top 16 bits should always be clear */
++			if (pend > 0xFFFF) {
++				netdev_warn(dev, "Ignoring unexpectedly set high order bits in NEWDAT1: 0x%x", pend);
++				pend &= 0xFFFF;
++			}
+ 			/*
+ 			 * If the pending field has a gap, handle the
+ 			 * bits above the gap first.
+@@ -1021,10 +1160,26 @@ static int c_can_poll(struct napi_struct *napi, int quota)
+ 	u16 curr, last = priv->last_status;
+ 	int work_done = 0;
+ 
++	/* Explicitly check for unexpected interrupt sources */
++	if (priv->last_int_source && priv->last_int_source != 0x8000) {
++		u32 obj = priv->last_int_source;
++
++		if (obj <= C_CAN_MSG_OBJ_RX_LAST) {
++			netdev_warn(dev, "Interrupt unexpectedly triggered for Rx buffer ID %u", obj);
++		} else if (obj <= C_CAN_MSG_OBJ_TX_LAST) {
++			obj -= C_CAN_MSG_OBJ_RX_LAST;
++			netdev_warn(dev, "Interrupt unexpectedly triggered for Tx buffer ID %u", obj);
++		} else if (obj > C_CAN_MSG_OBJ_TX_LAST) {
++			netdev_warn(dev, "Interrupt triggered for unknown source ID 0x%x", obj);
++		}
++	}
++	priv->last_int_source = 0;
++
+ 	priv->last_status = curr = priv->read_reg(priv, C_CAN_STS_REG);
+-	/* Ack status on C_CAN. D_CAN is self clearing */
+-	if (priv->type != BOSCH_D_CAN)
++	if (priv->type != BOSCH_D_CAN) {
++		/* Explicitly clear TXOK/RXOK (and hardware interrupt on older devices) */
+ 		priv->write_reg(priv, C_CAN_STS_REG, LEC_UNUSED);
++	}
+ 
+ 	/* handle state changes */
+ 	if ((curr & STATUS_EWARN) && (!(last & STATUS_EWARN))) {
+@@ -1075,10 +1230,13 @@ static irqreturn_t c_can_isr(int irq, void *dev_id)
+ {
+ 	struct net_device *dev = (struct net_device *)dev_id;
+ 	struct c_can_priv *priv = netdev_priv(dev);
++	int last_int_source;
+ 
+-	if (!priv->read_reg(priv, C_CAN_INT_REG))
++	if (!(last_int_source = priv->read_reg(priv, C_CAN_INT_REG)))
+ 		return IRQ_NONE;
+ 
++	priv->last_int_source = last_int_source;
++
+ 	/* disable all interrupts and schedule the NAPI */
+ 	c_can_irq_control(priv, false);
+ 	napi_schedule(&priv->napi);
+@@ -1121,6 +1279,7 @@ static int c_can_open(struct net_device *dev)
+ 	c_can_irq_control(priv, true);
+ 	netif_start_queue(dev);
+ 
++	netdev_info(dev, "Tritium: c_can_open\n");
+ 	return 0;
+ 
+ exit_start_fail:
+@@ -1148,6 +1307,7 @@ static int c_can_close(struct net_device *dev)
+ 
+ 	can_led_event(dev, CAN_LED_EVENT_STOP);
+ 
++	netdev_info(dev, "Tritium: c_can_close\n");
+ 	return 0;
+ }
+ 
+diff --git a/drivers/net/can/c_can/c_can.h b/drivers/net/can/c_can/c_can.h
+index 99ad1aa576b0..141a6dcc8592 100644
+--- a/drivers/net/can/c_can/c_can.h
++++ b/drivers/net/can/c_can/c_can.h
+@@ -35,8 +35,6 @@
+ #define C_CAN_MSG_OBJ_TX_LAST	(C_CAN_MSG_OBJ_TX_FIRST + \
+ 				C_CAN_MSG_OBJ_TX_NUM - 1)
+ 
+-#define C_CAN_MSG_OBJ_RX_SPLIT	9
+-#define C_CAN_MSG_RX_LOW_LAST	(C_CAN_MSG_OBJ_RX_SPLIT - 1)
+ #define RECEIVE_OBJECT_BITS	0x0000ffff
+ 
+ enum reg {
+@@ -192,6 +190,7 @@ struct c_can_priv {
+ 	u32 comm_rcv_high;
+ 	u32 rxmasked;
+ 	u32 dlc[C_CAN_MSG_OBJ_TX_NUM];
++	u32 last_int_source; /* Reporting unexpected interrupt sources */
+ };
+ 
+ struct net_device *alloc_c_can_dev(void);
