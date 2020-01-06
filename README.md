@@ -15,7 +15,7 @@ environments, these two assumptions may be false.
 The patches in this repo modify the c_can driver implementation to avoid
 making either of those assumptions. They definitely introduce some additional
 latency, and probably limit the maximum data throughput of the driver, but
-are known to be able to cope with at least of 500 kbps CAN bus rate.
+are known to be able to cope with a CAN bus rate of at least 500 kbps.
 
 The patches also make various other changes that simplified the process of
 identifying the underlying hardware faults (including turning off all the
