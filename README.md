@@ -33,11 +33,11 @@ Building the modified drivers
    networking section, and the Bosch C_CAN/D_CAN module is enabled in the
    CAN device driver section):
 
-    make ARCH=i386 defconfig
-    make oldconfig
-    make prepare
-    make modules
-    make M=drivers/net/can
+       make ARCH=i386 defconfig
+       make oldconfig
+       make prepare
+       make modules
+       make M=drivers/net/can
 
 This will produce the following relevant driver files:
 
